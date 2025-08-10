@@ -7,6 +7,8 @@
 #include <mutex>
 #include <dlfcn.h>
 #include <cmath>
+#include <thread>
+#include <atomic>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -43,6 +45,20 @@ static bool surface_ready = false;
 
 // Thread synchronization
 static std::mutex egl_mutex;
+
+// AM2302 sensor support
+static std::atomic<bool> sensor_enabled{false}; // Default disabled
+static std::atomic<int> polling_interval_ms{0}; // Default disabled (0 = off)
+static std::thread sensor_thread;
+static std::mutex sensor_mutex;
+static float last_temperature = 0.0f;
+static float last_humidity = 0.0f;
+static bool sensor_data_valid = false;
+
+// Platform channel names
+static const char* TEMPERATURE_CHANNEL = "pi_embedder/temperature";
+static const char* HUMIDITY_CHANNEL = "pi_embedder/humidity";
+static const char* SENSOR_METHOD_CHANNEL = "pi_embedder/sensor_control";
 
 // Flutter OpenGL callbacks
 static bool make_current(void *user_data) {
@@ -136,6 +152,104 @@ static void vsync_callback(void* /*user_data*/, intptr_t baton) {
     if (r != kSuccess) {
         fprintf(stderr, "OnVsync failed: %d\n", r);
     }
+}
+
+// AM2302 sensor functions
+static bool read_am2302_sensor(float* temperature, float* humidity) {
+    // Use Python script to read AM2302 sensor (same approach as pimotivation)
+    FILE* pipe = popen("python3 -c \"import board; import adafruit_dht; import time; dht = adafruit_dht.DHT22(board.D4, use_pulseio=False); time.sleep(2); temp = dht.temperature; hum = dht.humidity; print(f'{temp:.1f},{hum:.0f}' if temp is not None and hum is not None else 'ERROR'); dht.exit()\" 2>/dev/null", "r");
+    
+    if (!pipe) {
+        return false;
+    }
+    
+    char buffer[128];
+    if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        pclose(pipe);
+        
+        // Parse "temperature,humidity" format
+        char* comma = strchr(buffer, ',');
+        if (comma) {
+            *comma = '\0';
+            *temperature = atof(buffer);
+            *humidity = atof(comma + 1);
+            
+            // Validate reasonable ranges
+            if (*temperature > -40 && *temperature < 80 && *humidity >= 0 && *humidity <= 100) {
+                return true;
+            }
+        }
+    } else {
+        pclose(pipe);
+    }
+    
+    return false;
+}
+
+static void send_sensor_event_to_flutter(const char* channel, float value) {
+    if (!engine) return;
+    
+    // Create JSON message with timestamp
+    char message[256];
+    auto now = std::chrono::system_clock::now();
+    auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    
+    snprintf(message, sizeof(message), "{\"value\":%.1f,\"timestamp\":%lld}", value, (long long)timestamp);
+    
+    // Send event to Flutter EventChannel
+    FlutterPlatformMessage platform_message = {};
+    platform_message.struct_size = sizeof(FlutterPlatformMessage);
+    platform_message.channel = channel;
+    platform_message.message = reinterpret_cast<const uint8_t*>(message);
+    platform_message.message_size = strlen(message);
+    platform_message.response_handle = nullptr;
+    
+    FlutterEngineResult result = FlutterEngineSendPlatformMessage(engine, &platform_message);
+    if (result != kSuccess) {
+        fprintf(stderr, "Failed to send sensor event to channel %s: %d\n", channel, result);
+    }
+}
+
+static void sensor_polling_thread() {
+    printf("AM2302 sensor thread started\n");
+    
+    while (sensor_enabled.load()) {
+        int current_interval = polling_interval_ms.load();
+        
+        // If interval is 0, sensor is disabled - just wait and continue
+        if (current_interval == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // Check every second
+            continue;
+        }
+        
+        float temperature, humidity;
+        
+        if (read_am2302_sensor(&temperature, &humidity)) {
+            {
+                std::lock_guard<std::mutex> lock(sensor_mutex);
+                last_temperature = temperature;
+                last_humidity = humidity;
+                sensor_data_valid = true;
+            }
+            
+            // Send events to Flutter
+            send_sensor_event_to_flutter(TEMPERATURE_CHANNEL, temperature);
+            send_sensor_event_to_flutter(HUMIDITY_CHANNEL, humidity);
+            
+            printf("AM2302: T=%.1f°C, H=%.0f%%\n", temperature, humidity);
+        } else {
+            printf("AM2302: Failed to read sensor\n");
+            {
+                std::lock_guard<std::mutex> lock(sensor_mutex);
+                sensor_data_valid = false;
+            }
+        }
+        
+        // Sleep for the configured interval
+        std::this_thread::sleep_for(std::chrono::milliseconds(current_interval));
+    }
+    
+    printf("AM2302 sensor thread stopped\n");
 }
 
 // Initialize X11 window with proper visual
@@ -276,6 +390,78 @@ static bool create_egl_surface_and_contexts() {
     return true;
 }
 
+// Platform message handler for method channels
+static void platform_message_handler(const FlutterPlatformMessage* message, void* /*user_data*/) {
+    if (strcmp(message->channel, SENSOR_METHOD_CHANNEL) == 0) {
+        // Parse method call (simplified JSON parsing)
+        std::string msg(reinterpret_cast<const char*>(message->message), message->message_size);
+        
+        printf("Received method call on %s: %s\n", SENSOR_METHOD_CHANNEL, msg.c_str());
+        
+        // Simple parsing for setPollingInterval method
+        if (msg.find("\"setPollingInterval\"") != std::string::npos) {
+            // Extract interval value (simplified parsing)
+            size_t pos = msg.find("\"interval\":");
+            if (pos != std::string::npos) {
+                pos += 11; // Skip "interval":
+                int new_interval = std::atoi(msg.c_str() + pos);
+                
+                if ((new_interval >= 1000 && new_interval <= 60000) || new_interval == 0) { // 1s to 60s or 0 (off)
+                    polling_interval_ms.store(new_interval);
+                    if (new_interval == 0) {
+                        printf("AM2302: Polling disabled\n");
+                    } else {
+                        printf("AM2302: Polling interval changed to %d ms\n", new_interval);
+                    }
+                    
+                    // Send success response
+                    if (message->response_handle) {
+                        const char* success_response = "{\"success\":true}";
+                        FlutterEngineSendPlatformMessageResponse(
+                            engine, message->response_handle,
+                            reinterpret_cast<const uint8_t*>(success_response),
+                            strlen(success_response));
+                    }
+                } else {
+                    // Send error response
+                    if (message->response_handle) {
+                        const char* error_response = "{\"error\":\"Invalid interval range (0 or 1000-60000ms)\"}";
+                        FlutterEngineSendPlatformMessageResponse(
+                            engine, message->response_handle,
+                            reinterpret_cast<const uint8_t*>(error_response),
+                            strlen(error_response));
+                    }
+                }
+            }
+        }
+        else if (msg.find("\"getCurrentData\"") != std::string::npos) {
+            // Return current sensor data
+            std::lock_guard<std::mutex> lock(sensor_mutex);
+            if (sensor_data_valid) {
+                char response[256];
+                snprintf(response, sizeof(response), 
+                    "{\"temperature\":%.1f,\"humidity\":%.0f,\"valid\":true}",
+                    last_temperature, last_humidity);
+                
+                if (message->response_handle) {
+                    FlutterEngineSendPlatformMessageResponse(
+                        engine, message->response_handle,
+                        reinterpret_cast<const uint8_t*>(response),
+                        strlen(response));
+                }
+            } else {
+                const char* no_data_response = "{\"valid\":false}";
+                if (message->response_handle) {
+                    FlutterEngineSendPlatformMessageResponse(
+                        engine, message->response_handle,
+                        reinterpret_cast<const uint8_t*>(no_data_response),
+                        strlen(no_data_response));
+                }
+            }
+        }
+    }
+}
+
 // Initialize Flutter engine
 static bool init_flutter(const char* assets_path, const char* icu_path) {
     // Set up renderer config
@@ -295,6 +481,7 @@ static bool init_flutter(const char* assets_path, const char* icu_path) {
     args.assets_path = assets_path;
     args.icu_data_path = icu_path;
     args.vsync_callback = vsync_callback;
+    args.platform_message_callback = platform_message_handler;
     
     // Command line arguments for debug mode
     const char* command_line_args[] = {
@@ -332,6 +519,10 @@ static bool init_flutter(const char* assets_path, const char* icu_path) {
     if (result != kSuccess) {
         fprintf(stderr, "Failed to send window metrics\n");
     }
+    
+    // Start AM2302 sensor thread (starts disabled by default)
+    sensor_enabled.store(true);
+    sensor_thread = std::thread(sensor_polling_thread);
     
     return true;
 }
@@ -509,6 +700,12 @@ int main(int argc, char **argv) {
     handle_events();
     
     // Cleanup
+    // Stop sensor thread
+    sensor_enabled.store(false);
+    if (sensor_thread.joinable()) {
+        sensor_thread.join();
+    }
+    
     if (engine) {
         FlutterEngineShutdown(engine);
     }
