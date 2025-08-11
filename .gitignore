@@ -17,5 +17,6 @@ flutter_assets.tar.gz
 .vscode/
 .idea/
 
-# Test files
-test_*
+# Test files (except the DHT22 test)
+test_*.o
+test_*.out
