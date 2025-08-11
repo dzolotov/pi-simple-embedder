@@ -14,6 +14,7 @@ pkg_check_modules(GLES2 REQUIRED glesv2)
 add_executable(flutter_x11_embedder
     x11_embedder.cc
     dht22_threaded.cc
+    camera_texture.cc
 )
 
 # Include directories

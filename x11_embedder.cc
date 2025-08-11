@@ -18,6 +18,7 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <flutter_embedder.h>
+#include "camera_texture.h"
 
 // Window dimensions
 static const int WINDOW_WIDTH = 1280;
@@ -59,6 +60,10 @@ static bool sensor_data_valid = false;
 // Platform channel names
 static const char* SENSOR_DATA_CHANNEL = "pi_embedder/sensor_data";
 static const char* SENSOR_METHOD_CHANNEL = "pi_embedder/sensor_control";
+static const char* CAMERA_CHANNEL = "pi_embedder/camera";
+
+// Camera support
+static CameraTexture* camera_texture = nullptr;
 
 // Flutter OpenGL callbacks
 static bool make_current(void *user_data) {
@@ -154,6 +159,17 @@ static void vsync_callback(void* /*user_data*/, intptr_t baton) {
     }
 }
 
+// External texture callback for camera
+static bool external_texture_callback(void* user_data, int64_t texture_id,
+                                     size_t width, size_t height,
+                                     FlutterOpenGLTexture* texture) {
+    if (!camera_texture || camera_texture->GetTextureId() != texture_id) {
+        return false;
+    }
+    
+    return camera_texture->GetTextureInfo(texture);
+}
+
 // External DHT22 threaded functions
 extern "C" {
     bool dht22_init();
@@ -163,8 +179,6 @@ extern "C" {
     bool dht22_is_running();
     int dht22_get_data_age_ms();
 }
-
-// Camera support will be added in a separate branch
 
 // AM2302 sensor functions - removed, now handled by threaded implementation
 
@@ -481,6 +495,46 @@ static void platform_message_handler(const FlutterPlatformMessage* message, void
             }
         }
     }
+    
+    // Handle camera channel messages
+    if (strcmp(message->channel, CAMERA_CHANNEL) == 0) {
+        std::string msg(reinterpret_cast<const char*>(message->message), message->message_size);
+        printf("Received camera method call: %s\n", msg.c_str());
+        
+        if (msg.find("\"startCamera\"") != std::string::npos) {
+            if (camera_texture) {
+                bool started = camera_texture->Start();
+                char response[256];
+                if (started) {
+                    snprintf(response, sizeof(response), 
+                        "{\"success\":true,\"textureId\":%lld}", 
+                        camera_texture->GetTextureId());
+                } else {
+                    snprintf(response, sizeof(response), 
+                        "{\"success\":false,\"error\":\"Failed to start camera\"}");
+                }
+                
+                if (message->response_handle) {
+                    FlutterEngineSendPlatformMessageResponse(
+                        engine, message->response_handle,
+                        reinterpret_cast<const uint8_t*>(response),
+                        strlen(response));
+                }
+            }
+        }
+        else if (msg.find("\"stopCamera\"") != std::string::npos) {
+            if (camera_texture) {
+                camera_texture->Stop();
+                const char* response = "{\"success\":true}";
+                if (message->response_handle) {
+                    FlutterEngineSendPlatformMessageResponse(
+                        engine, message->response_handle,
+                        reinterpret_cast<const uint8_t*>(response),
+                        strlen(response));
+                }
+            }
+        }
+    }
 }
 
 // Initialize Flutter engine
@@ -495,6 +549,7 @@ static bool init_flutter(const char* assets_path, const char* icu_path) {
     config.open_gl.fbo_callback = fbo_callback;
     config.open_gl.make_resource_current = make_resource_current;
     config.open_gl.gl_proc_resolver = gl_proc_resolver;
+    config.open_gl.external_texture_frame_callback = external_texture_callback;
     
     // Set up project args
     FlutterProjectArgs args = {};
@@ -545,7 +600,15 @@ static bool init_flutter(const char* assets_path, const char* icu_path) {
     sensor_enabled.store(true);
     sensor_thread = std::thread(sensor_polling_thread);
     
-    // Camera initialization would go here in camera branch
+    // Initialize camera texture
+    camera_texture = new CameraTexture(engine);
+    if (camera_texture->Initialize()) {
+        printf("Camera texture initialized successfully\n");
+    } else {
+        fprintf(stderr, "Failed to initialize camera texture\n");
+        delete camera_texture;
+        camera_texture = nullptr;
+    }
     
     return true;
 }
@@ -752,7 +815,12 @@ int main(int argc, char **argv) {
     // Cleanup DHT22 native reader
     dht22_cleanup();
     
-    // Camera cleanup would go here in camera branch
+    // Cleanup camera
+    if (camera_texture) {
+        camera_texture->Stop();
+        delete camera_texture;
+        camera_texture = nullptr;
+    }
     
     if (engine) {
         FlutterEngineShutdown(engine);
