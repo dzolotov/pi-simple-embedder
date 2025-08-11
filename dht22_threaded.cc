@@ -13,8 +13,8 @@
 #include <pthread.h>
 
 // Configuration
-#define PYTHON_SCRIPT_PATH "/home/dmitrii/flutter_pi_demo/read_am2302.py"
-#define UPDATE_INTERVAL_MS 5000  // Update every 5 seconds
+#define PYTHON_SCRIPT_PATH "/home/dmitrii/flutter_pi_demo/read_am2302_simple.py"
+#define UPDATE_INTERVAL_MS 10000  // Update every 10 seconds (simple script is faster)
 #define MIN_READ_INTERVAL_MS 2000
 
 // Thread-safe sensor data
@@ -104,9 +104,9 @@ private:
         
         printf("DHT22: [Thread] Executing script: %s\n", PYTHON_SCRIPT_PATH);
         
-        // Run Python script with timeout and sudo for GPIO access
+        // Run Python script with timeout (no sudo needed - user is in gpio group)
         char command[256];
-        snprintf(command, sizeof(command), "sudo timeout 25 /usr/bin/python3 %s 2>&1", PYTHON_SCRIPT_PATH);
+        snprintf(command, sizeof(command), "timeout 25 /usr/bin/python3 %s 2>&1", PYTHON_SCRIPT_PATH);
         
         FILE* pipe = popen(command, "r");
         if (!pipe) {
