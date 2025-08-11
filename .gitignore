@@ -1,0 +1,21 @@
+# Build files
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+flutter_x11_embedder
+
+# Flutter assets
+flutter_assets/
+flutter_assets.tar.gz
+
+# IDE files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Test files
+test_*
